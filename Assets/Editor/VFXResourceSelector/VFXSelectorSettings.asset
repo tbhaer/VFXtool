@@ -16,11 +16,14 @@ MonoBehaviour:
   interceptTextures: 1
   interceptMaterials: 1
   interceptMeshes: 1
-  useCustomRules: 0
+  useCustomRules: 1
   categoryRules:
   - name: Effect
     prefix: Effect
     subCategories:
     - name: VoiceNationalWar
       prefix: VoiceNationalWar
+      subSubCategories: []
+    - name: NationalWarWeb
+      prefix: NationalWarWeb
       subSubCategories: []

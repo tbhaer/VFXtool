@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using UnityEditor;
 using UnityEditor.SearchService;
 using UnityEngine;
@@ -49,6 +50,11 @@ public class VFXResourceSelectorWindow : EditorWindow
     private List<ResourceItem> allItems = new List<ResourceItem>();
     private List<ResourceItem> filteredItems = new List<ResourceItem>();
     private Vector2 scroll;
+    private bool autoScrollToSelectedOnOpen;
+    private const float MinThumbnailSize = 72f;
+    private const float MaxThumbnailSize = MinThumbnailSize * 2f;
+    private const string ThumbnailSizePrefsKey = "VFXResourceSelector.ThumbnailSize";
+    private float thumbnailSize = MinThumbnailSize;
 
     // ---- 设置面板 ----
     private bool showSettings;
@@ -57,6 +63,15 @@ public class VFXResourceSelectorWindow : EditorWindow
     private readonly HashSet<int> expandedSubSubRules = new HashSet<int>();
 
     private static VFXResourceSelectorWindow s_Instance;
+    private int scanGeneration;
+
+    private void OnEnable()
+    {
+        thumbnailSize = Mathf.Clamp(
+            EditorPrefs.GetFloat(ThumbnailSizePrefsKey, MinThumbnailSize),
+            MinThumbnailSize,
+            MaxThumbnailSize);
+    }
 
     // ================= 打开入口 =================
 
@@ -153,6 +168,8 @@ public class VFXResourceSelectorWindow : EditorWindow
 
     private void InitAndShow()
     {
+        autoScrollToSelectedOnOpen = selectedItem != null;
+
         // 根据字段类型锁定/显示类型标签
         if (typeLocked && allowedTypes.Count == 1)
         {
@@ -226,59 +243,94 @@ public class VFXResourceSelectorWindow : EditorWindow
         public string path;
         public string subAssetName; // 子资产名（如 FBX 内的 Mesh 名）；空 = 主资产
         public Object asset;        // 懒加载缓存（大项目避免全量加载资源对象）
+        public VFXResourceSelectorWindow owner;
         public string name;
         public string typeKey;      // "Texture" / "Material" / "Mesh"
+        public int scanGeneration;
         public bool assetLoaded;
         public bool isBuiltin;
         public int builtinOrder;
+        public double lastVisibleTime;
+        public Texture2D preview;
+        public Texture2D fallbackThumbnail;
+        public bool textureCopyFailed;
+        public bool previewRequestStarted;
+        public bool previewRequestInFlight;
+        public int previewRequestAttempts;
+        public double previewRequestStartedAt;
 
         /// <summary>按需加载资源对象并缓存。只在绘制/选择时调用，避免扫描时加载全部资源导致卡顿或崩溃。</summary>
         public Object GetAsset()
         {
-            if (!assetLoaded)
-            {
-                if (!string.IsNullOrEmpty(subAssetName))
-                {
-                    // 子资产（如 FBX 内的 Mesh）：从子资产中按名字匹配
-                    Object[] reps = AssetDatabase.LoadAllAssetRepresentationsAtPath(path);
-                    foreach (Object o in reps)
-                    {
-                        if (o != null && o is Mesh && o.name == subAssetName)
-                        {
-                            asset = o;
-                            break;
-                        }
-                    }
-                }
-                if (asset == null)
-                {
-                    asset = AssetDatabase.LoadAssetAtPath<Object>(path);
-                }
-                assetLoaded = true;
-            }
-            return asset;
+            if (assetLoaded) return asset;
+            return owner != null ? owner.GetCachedAsset(this) : null;
         }
     }
 
     private void ScanResources()
     {
+        if (meshScanUpdateSubscribed)
+        {
+            EditorApplication.update -= ProcessMeshScan;
+            meshScanUpdateSubscribed = false;
+        }
+        isScanningMeshes = false;
+        pendingMeshPaths.Clear();
+        cachePrunePending = false;
+        cachePruneCursor = 0;
+        scanGeneration++;
+        DestroyOwnedPreviews();
         allItems.Clear();
+        loadedAssetCache.Clear();
+        loadedAssetCacheOrder.Clear();
+        meshRepresentationsCache.Clear();
+        meshRepresentationsCacheOrder.Clear();
+        failedAssetLoadWarnings.Clear();
+        attemptedLoadKeys.Clear();
+        meshScanErrorCount = 0;
+        firstMeshScanError = null;
 
         // 分类浏览时一次扫描三种资源，切换类型标签只做内存过滤。
         // 字段锁定为单一类型时只扫描该类型，避免无关资源拖慢原生字段选择。
+        string[] meshPaths = new string[0];
         if (typeLocked && activeType == "Texture") AddType<Texture>("Texture");
         else if (typeLocked && activeType == "Material") AddType<Material>("Material");
-        else if (typeLocked && activeType == "Mesh") AddType<Mesh>("Mesh");
+        else if (typeLocked && activeType == "Mesh") meshPaths = FindAssetPaths<Mesh>();
         else
         {
             AddType<Texture>("Texture");
             AddType<Material>("Material");
-            AddType<Mesh>("Mesh");
+            meshPaths = FindAssetPaths<Mesh>();
         }
         builtinOrder = 0;
         builtinAssetKeys.Clear();
         AddBuiltinTemplates();
+        for (int i = 0; i < allItems.Count; i++)
+        {
+            allItems[i].owner = this;
+            allItems[i].scanGeneration = scanGeneration;
+        }
 
+        foreach (string path in meshPaths)
+        {
+            pendingMeshPaths.Enqueue(path);
+        }
+        totalMeshPaths = pendingMeshPaths.Count;
+        scannedMeshPaths = 0;
+        if (pendingMeshPaths.Count > 0)
+        {
+            isScanningMeshes = true;
+            EditorApplication.update += ProcessMeshScan;
+            meshScanUpdateSubscribed = true;
+            Repaint();
+            return;
+        }
+
+        FinishResourceScan();
+    }
+
+    private void FinishResourceScan()
+    {
         allItems.Sort((a, b) =>
         {
             if (a.isBuiltin != b.isBuiltin)
@@ -291,13 +343,64 @@ public class VFXResourceSelectorWindow : EditorWindow
             }
             return string.Compare(a.name, b.name, StringComparison.OrdinalIgnoreCase);
         });
+        for (int i = 0; i < allItems.Count; i++)
+        {
+            allItems[i].owner = this;
+            allItems[i].scanGeneration = scanGeneration;
+        }
 
-        // 关键：AssetPreview 默认只缓存 100 张预览图，资源多时预览会互相挤掉，
-        // 表现为缩略图反复在占位符与预览图之间闪烁、大量预览刷不出来。
-        // 原生 ObjectSelector 同样会按资源数量扩容，这里在每次扫描/切类型时设置一次。
-        AssetPreview.SetPreviewTextureCacheSize(Mathf.Clamp(allItems.Count, 256, 2048));
-        previewRequested.Clear();
+        // 不调整 AssetPreview 的全局缓存容量：该缓存供整个 Editor 共用，
+        // 按项目资源数量扩容会在大型工程中造成持续的显存/内存压力。
         InvalidateCategoryCache();
+        isScanningMeshes = false;
+        if (meshScanErrorCount > 0)
+        {
+            Debug.LogWarning("[VFX Resource Selector] 跳过了 " + meshScanErrorCount
+                + " 个无法扫描的网格资源。首个错误：" + firstMeshScanError);
+        }
+        RefreshFiltered();
+        Repaint();
+    }
+
+    private void ProcessMeshScan()
+    {
+        if (this == null || !isScanningMeshes)
+        {
+            EditorApplication.update -= ProcessMeshScan;
+            meshScanUpdateSubscribed = false;
+            return;
+        }
+
+        long startedAt = Stopwatch.GetTimestamp();
+        int processed = 0;
+        while (pendingMeshPaths.Count > 0 && processed < 8
+            && (Stopwatch.GetTimestamp() - startedAt) * 1000.0 / Stopwatch.Frequency < 8.0)
+        {
+            string path = pendingMeshPaths.Dequeue();
+            try
+            {
+                AddMeshSubAssets(path);
+            }
+            catch (Exception e)
+            {
+                meshScanErrorCount++;
+                if (string.IsNullOrEmpty(firstMeshScanError)) firstMeshScanError = path + "\n" + e.Message;
+            }
+            processed++;
+            scannedMeshPaths++;
+        }
+
+        if (pendingMeshPaths.Count == 0 || EditorApplication.timeSinceStartup >= nextScanRepaintTime)
+        {
+            nextScanRepaintTime = EditorApplication.timeSinceStartup + 0.1;
+            Repaint();
+        }
+        if (pendingMeshPaths.Count == 0)
+        {
+            EditorApplication.update -= ProcessMeshScan;
+            meshScanUpdateSubscribed = false;
+            FinishResourceScan();
+        }
     }
 
     /// <summary>Unity 原生 Object Selector 会展示的内置 Mesh 与 Editor Texture。</summary>
@@ -413,40 +516,92 @@ public class VFXResourceSelectorWindow : EditorWindow
     /// <summary>扫描指定类型资源：只记录路径与文件名元数据，不加载资源对象（懒加载见 ResourceItem.GetAsset）。</summary>
     private void AddType<T>(string typeKey) where T : Object
     {
-        string[] guids = AssetDatabase.FindAssets("t:" + typeof(T).Name);
+        foreach (string path in FindAssetPaths<T>())
+        {
+            allItems.Add(new ResourceItem
+            {
+                path = path,
+                name = Path.GetFileNameWithoutExtension(path),
+                typeKey = typeKey
+            });
+        }
+    }
+
+    private static string[] FindAssetPaths<T>() where T : Object
+    {
+        // 本选择器只展示 Assets 下的项目资源，避免额外扫描 Packages。
+        string[] guids = AssetDatabase.FindAssets("t:" + typeof(T).Name, new[] { "Assets" });
+        List<string> paths = new List<string>(guids.Length);
         foreach (string guid in guids)
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
-            if (!path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
+            if (!path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)) continue;
+            // 按主资产类型过滤：TerrainData 等会被 t:Mesh/t:Texture 误命中，加载会触发原生崩溃，从 GUID 层就挡掉。
+            if (!IsCompatibleMainType(path, typeof(T))) continue;
+            paths.Add(path);
+        }
+        return paths.ToArray();
+    }
 
-            if (typeKey == "Mesh")
+    /// <summary>校验路径的主资产类型是否属于预期类型；Mesh 额外允许 FBX 模型（其主资产为 GameObject）。</summary>
+    private static bool IsCompatibleMainType(string path, Type expectedType)
+    {
+        try
+        {
+            Type mainType = AssetDatabase.GetMainAssetTypeAtPath(path);
+            if (mainType == null)
             {
-                AddMeshSubAssets(path);
+                return false; // 类型未知时不加载，避免把导入中/失效路径传给原生资源加载器
             }
-            else
+            if (expectedType.IsAssignableFrom(mainType))
             {
-                allItems.Add(new ResourceItem
-                {
-                    path = path,
-                    name = Path.GetFileNameWithoutExtension(path),
-                    typeKey = typeKey
-                });
+                return true;
             }
+            return expectedType == typeof(Mesh)
+                && typeof(GameObject).IsAssignableFrom(mainType)
+                && AssetImporter.GetAtPath(path) is ModelImporter;
+        }
+        catch
+        {
+            return false; // 刷新期间失效的 GUID/path 安全跳过
         }
     }
 
     /// <summary>
     /// 网格类型：列出文件内的全部 Mesh 子资产（FBX/模型文件常含多个网格），
     /// 按网格资产名分类与显示，而不是用整个模型文件名。
-    /// 文件内无 Mesh 子资产（如 .mesh 资产）时回退为主资产。
+    /// 单独的 Mesh 主资产直接作为一项；模型文件只列出明确的 Mesh 子资产。
     /// </summary>
     private void AddMeshSubAssets(string path)
     {
-        bool added = false;
+        Type mainType = AssetDatabase.GetMainAssetTypeAtPath(path);
+        if (mainType == null)
+        {
+            return;
+        }
+
+        if (typeof(Mesh).IsAssignableFrom(mainType))
+        {
+            allItems.Add(new ResourceItem
+            {
+                path = path,
+                name = Path.GetFileNameWithoutExtension(path),
+                typeKey = "Mesh"
+            });
+            return;
+        }
+
+        // 只枚举明确由 ModelImporter 导入的模型子资产；Prefab/GameObject 和未知类型不进入原生子资产加载 API。
+        if (!typeof(GameObject).IsAssignableFrom(mainType) || !(AssetImporter.GetAtPath(path) is ModelImporter))
+        {
+            return;
+        }
+
         Object[] reps = AssetDatabase.LoadAllAssetRepresentationsAtPath(path);
+        if (reps == null)
+        {
+            return;
+        }
         foreach (Object o in reps)
         {
             Mesh m = o as Mesh;
@@ -461,18 +616,167 @@ public class VFXResourceSelectorWindow : EditorWindow
                 name = m.name,
                 typeKey = "Mesh"
             });
-            added = true;
+        }
+    }
+
+    private Object GetCachedAsset(ResourceItem item)
+    {
+        string key = item.path + "|" + item.subAssetName;
+        Object cached;
+        if (loadedAssetCache.TryGetValue(key, out cached))
+        {
+            if (cached != null)
+            {
+                return cached;
+            }
+            loadedAssetCache.Remove(key); // 清除已被 Unity 卸载的伪空对象，允许安全重载
         }
 
-        if (!added)
+        // 加载前先检查主资产类型：TerrainData 等资源加载会触发 Unity 原生崩溃（DetailDatabase），
+        // 且不属于本选择器展示范围（贴图 / 材质 / 网格 / FBX 模型），一律跳过，返回 null 走占位。
+        Type mainType;
+        bool expectedTypeMatches;
+        try
         {
-            allItems.Add(new ResourceItem
+            mainType = AssetDatabase.GetMainAssetTypeAtPath(item.path);
+            if (mainType == null)
             {
-                path = path,
-                name = Path.GetFileNameWithoutExtension(path),
-                typeKey = "Mesh"
-            });
+                return null;
+            }
+            expectedTypeMatches = item.typeKey == "Texture" && typeof(Texture).IsAssignableFrom(mainType)
+                || item.typeKey == "Material" && typeof(Material).IsAssignableFrom(mainType)
+                || item.typeKey == "Mesh" && (typeof(Mesh).IsAssignableFrom(mainType)
+                    || typeof(GameObject).IsAssignableFrom(mainType)
+                    && AssetImporter.GetAtPath(item.path) is ModelImporter);
         }
+        catch (Exception e)
+        {
+            if (failedAssetLoadWarnings.Add(item.path))
+            {
+                Debug.LogWarning("[VFX Resource Selector] 校验资源类型失败，已跳过：" + item.path + "\n" + e.Message);
+            }
+            return null;
+        }
+        if (!expectedTypeMatches)
+        {
+            return null;
+        }
+
+        Object loaded = null;
+        try
+        {
+            if (!string.IsNullOrEmpty(item.subAssetName))
+            {
+                Object[] representations;
+                if (!meshRepresentationsCache.TryGetValue(item.path, out representations))
+                {
+                    representations = AssetDatabase.LoadAllAssetRepresentationsAtPath(item.path);
+                    if (representations == null) representations = new Object[0];
+                    while (meshRepresentationsCache.Count >= MaxMeshFileCacheCount && meshRepresentationsCacheOrder.Count > 0)
+                    {
+                        meshRepresentationsCache.Remove(meshRepresentationsCacheOrder.Dequeue());
+                    }
+                    meshRepresentationsCache[item.path] = representations;
+                    meshRepresentationsCacheOrder.Enqueue(item.path);
+                }
+                foreach (Object representation in representations)
+                {
+                    Mesh mesh = representation as Mesh;
+                    if (mesh != null && mesh.name == item.subAssetName)
+                    {
+                        loaded = mesh;
+                        break;
+                    }
+                }
+                if (loaded == null)
+                {
+                    return null; // 子网格已不存在时不回退加载 FBX 主 GameObject
+                }
+            }
+            if (loaded == null)
+            {
+                loaded = AssetDatabase.LoadAssetAtPath<Object>(item.path);
+            }
+        }
+        catch (Exception e)
+        {
+            if (failedAssetLoadWarnings.Add(item.path))
+            {
+                Debug.LogWarning("[VFX Resource Selector] 读取资源失败：" + item.path + "\n" + e.Message);
+            }
+        }
+
+        if (loaded != null && !IsLoadedAssetCompatible(item, loaded))
+        {
+            return null;
+        }
+
+        if (loaded != null)
+        {
+            // 贴图缩略图单独生成并持有小尺寸副本，不长期缓存全尺寸源图。
+            if (loaded is Texture)
+            {
+                return loaded;
+            }
+            while (loadedAssetCache.Count >= MaxLoadedAssetCacheCount && loadedAssetCacheOrder.Count > 0)
+            {
+                loadedAssetCache.Remove(loadedAssetCacheOrder.Dequeue());
+            }
+            loadedAssetCache[key] = loaded;
+            loadedAssetCacheOrder.Enqueue(key);
+        }
+        return loaded;
+    }
+
+    private static bool IsLoadedAssetCompatible(ResourceItem item, Object loaded)
+    {
+        if (item.typeKey == "Texture") return loaded is Texture;
+        if (item.typeKey == "Material") return loaded is Material;
+        if (item.typeKey == "Mesh") return loaded is Mesh;
+        return false;
+    }
+
+    /// <summary>按帧预算获取资源：命中缓存不计数；新加载受 MaxThumbLoadsPerFrame 限制，超预算返回 null（先占位）。</summary>
+    private Object GetAssetBudgeted(ResourceItem item)
+    {
+        if (item.assetLoaded)
+        {
+            return item.GetAsset();
+        }
+        string key = item.path + "|" + item.subAssetName;
+        if (loadedAssetCache.ContainsKey(key))
+        {
+            Object cached = item.GetAsset();
+            if (cached != null)
+            {
+                item.asset = cached;
+                item.assetLoaded = true;
+            }
+            return cached;   // 已加载：命中缓存，不计预算
+        }
+        if (attemptedLoadKeys.Contains(key))
+        {
+            return null;              // 已尝试过且未成功（损坏/读取失败），本会话不再重试
+        }
+        if (thumbLoadBudget >= MaxThumbLoadsPerFrame)
+        {
+            thumbLoadPending = true;  // 本帧预算耗尽：先占位，并请求下一帧继续
+            return null;
+        }
+        thumbLoadBudget++;
+        Object result = item.GetAsset();   // 触发懒加载
+        if (result == null)
+        {
+            attemptedLoadKeys.Add(key);    // 加载失败，标记避免下一帧反复重试
+        }
+        else
+        {
+            // 保留当前可见项自己的对象引用。共享 LRU 缓存容量较小，若可见项远多于
+            // 缓存容量，每帧从列表头加载会不断淘汰头部，导致后面的资源永久饥饿。
+            item.asset = result;
+            item.assetLoaded = true;
+        }
+        return result;
     }
 
     // ================= 过滤 =================
@@ -589,22 +893,8 @@ public class VFXResourceSelectorWindow : EditorWindow
         }
 
         // 内置资源固定置顶，其余资源按名称排序，接近 Unity 原生 Select 的布局。
-        filteredItems.Sort((a, b) =>
-        {
-            if (a.isBuiltin != b.isBuiltin)
-            {
-                return a.isBuiltin ? -1 : 1;
-            }
-            if (a.isBuiltin && a.builtinOrder != b.builtinOrder)
-            {
-                return a.builtinOrder.CompareTo(b.builtinOrder);
-            }
-            return string.Compare(a.name, b.name, StringComparison.OrdinalIgnoreCase);
-        });
+        // allItems 已在扫描后排序；按原顺序筛选即可，避免每次按键都再对大列表排序。
     }
-
-    /// <summary>本帧是否仍有可见预览在异步渲染（为 true 时在帧末请求一次 Repaint，出图后自动停止）。</summary>
-    private bool previewLoadingThisFrame;
 
     // ---- 自动分类列表缓存 ----
     // 资源量大时 GetLevelXCategories 每帧都是 O(N) 字符串解析，预览加载期的持续重绘会被它拖慢，
@@ -623,36 +913,35 @@ public class VFXResourceSelectorWindow : EditorWindow
     /// <summary>网格标签样式（只创建一次，避免每帧 new GUIStyle 产生 GC）。</summary>
     private GUIStyle gridLabelStyle;
 
-    /// <summary>已发起预览生成请求的键集合（去重，同一资源/子资产不重复排队）。</summary>
-    private readonly HashSet<string> previewRequested = new HashSet<string>();
+    /// <summary>并发中的 AssetPreview 请求，限制原生预览队列规模。</summary>
+    private readonly List<ResourceItem> activePreviewRequests = new List<ResourceItem>();
+    private readonly Dictionary<string, Object> loadedAssetCache = new Dictionary<string, Object>();
+    private readonly Queue<string> loadedAssetCacheOrder = new Queue<string>();
+    private readonly Dictionary<string, Object[]> meshRepresentationsCache = new Dictionary<string, Object[]>();
+    private readonly Queue<string> meshRepresentationsCacheOrder = new Queue<string>();
+    private readonly Queue<string> pendingMeshPaths = new Queue<string>();
+    private double nextPreviewRepaintTime;
+    private bool previewUpdateSubscribed;
+    private double nextCachePruneTime;
+    private int cachePruneCursor;
+    private bool cachePrunePending;
+    private bool meshScanUpdateSubscribed;
+    private bool isScanningMeshes;
+    private int totalMeshPaths;
+    private int scannedMeshPaths;
+    private double nextScanRepaintTime;
+    private int meshScanErrorCount;
+    private string firstMeshScanError;
+    private readonly HashSet<string> failedAssetLoadWarnings = new HashSet<string>();
 
-    /// <summary>
-    /// 发起预览预生成请求（去重）。贴图直接画原图不需要预览；
-    /// 材质 / 网格（含 FBX 主资产）等通过 AssetPreview 异步生成，Unity 内部队列后台处理。
-    /// 去重键必须包含子资产名，否则同一 FBX 内的多个 Mesh 会被当成同一个。
-    /// </summary>
-    private void EnsurePreviewRequested(ResourceItem item)
-    {
-        if (item == null || string.IsNullOrEmpty(item.path))
-        {
-            return;
-        }
-        string previewKey = string.IsNullOrEmpty(item.subAssetName)
-            ? item.path
-            : item.path + "|" + item.subAssetName;
-        if (previewRequested.Contains(previewKey))
-        {
-            return;
-        }
-        previewRequested.Add(previewKey);
-
-        Object asset = item.GetAsset();
-        if (asset == null || asset is Texture)
-        {
-            return;
-        }
-        AssetPreview.GetAssetPreview(asset); // 发起异步预生成
-    }
+    private const int MaxLoadedAssetCacheCount = 12;
+    private const int MaxMeshFileCacheCount = 4;
+    private const int MaxConcurrentPreviewRequests = 24;
+    private const double MaxPreviewWaitSeconds = 30.0;
+    private const int MaxThumbLoadsPerFrame = 12;  // 提高可见项加载吞吐，同时限制单帧资源加载突发量
+    private int thumbLoadBudget;                    // 本帧已新加载的资源计数（每帧在 DrawGrid 重置）
+    private bool thumbLoadPending;                  // 本帧预算耗尽、还有可见项没加载到缩略图，请求下一帧继续
+    private readonly HashSet<string> attemptedLoadKeys = new HashSet<string>();  // 加载失败过的项，本会话不再重试
 
     // ================= 分类列表 =================
 
@@ -902,6 +1191,7 @@ public class VFXResourceSelectorWindow : EditorWindow
         DrawTypeBar();
         DrawCategoryBars();
         DrawSearchBar();
+        DrawThumbnailSizeSlider();
         DrawGrid();
         DrawSettingsPanel();
         DrawFooter();
@@ -1082,16 +1372,48 @@ public class VFXResourceSelectorWindow : EditorWindow
         EditorGUILayout.EndHorizontal();
     }
 
+    private void DrawThumbnailSizeSlider()
+    {
+        EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
+        GUILayout.Label("缩略图", EditorStyles.miniLabel, GUILayout.Width(46));
+        GUILayout.Label(Mathf.RoundToInt(MinThumbnailSize).ToString(), EditorStyles.miniLabel, GUILayout.Width(22));
+        float newSize = GUILayout.HorizontalSlider(
+            thumbnailSize,
+            MinThumbnailSize,
+            MaxThumbnailSize,
+            GUILayout.Width(150));
+        GUILayout.Label(Mathf.RoundToInt(MaxThumbnailSize).ToString(), EditorStyles.miniLabel, GUILayout.Width(28));
+        newSize = Mathf.Clamp(Mathf.Round(newSize), MinThumbnailSize, MaxThumbnailSize);
+        if (!Mathf.Approximately(newSize, thumbnailSize))
+        {
+            thumbnailSize = newSize;
+            EditorPrefs.SetFloat(ThumbnailSizePrefsKey, thumbnailSize);
+            Repaint();
+        }
+        GUILayout.Label(Mathf.RoundToInt(thumbnailSize) + " px", EditorStyles.miniLabel, GUILayout.Width(42));
+        GUILayout.FlexibleSpace();
+        EditorGUILayout.EndHorizontal();
+    }
+
     private void DrawGrid()
     {
-        if (filteredItems.Count == 0)
+        thumbLoadBudget = 0;   // 每帧重置缩略图加载预算
+        thumbLoadPending = false;
+        if (isScanningMeshes)
+        {
+            float progress = totalMeshPaths > 0 ? scannedMeshPaths / (float)totalMeshPaths : 1f;
+            Rect progressRect = EditorGUILayout.GetControlRect(false, 18f);
+            EditorGUI.ProgressBar(progressRect, progress,
+                "正在扫描网格资源 " + scannedMeshPaths + " / " + totalMeshPaths);
+        }
+        else if (filteredItems.Count == 0)
         {
             EditorGUILayout.HelpBox(
                 "当前条件下没有项目资源；仍可选择 None 或使用内置通用模板。\n可切换类型/分类，或点击“刷新”。",
                 MessageType.Info);
         }
 
-        const float thumbSize = 72f;
+        float thumbSize = thumbnailSize;
         const float cellGap = 6f;
         const float labelHeight = 22f;
         const float padding = 8f;
@@ -1106,38 +1428,29 @@ public class VFXResourceSelectorWindow : EditorWindow
         float contentHeight = rowCount * cellH + padding * 2f;
         float contentWidth = scrollRect.width;
 
+        if (autoScrollToSelectedOnOpen)
+        {
+            int selectedIndex = IndexOfSelectedItem();
+            if (selectedIndex >= 0)
+            {
+                float selectedY = padding + (selectedIndex / columns) * cellH;
+                scroll.y = Mathf.Max(0f, selectedY - (scrollRect.height - cellH) * 0.5f);
+                autoScrollToSelectedOnOpen = false;
+            }
+            else if (!isScanningMeshes)
+            {
+                // 当前资源不在本选择器支持的资源列表中。
+                autoScrollToSelectedOnOpen = false;
+            }
+        }
+
         scroll = GUI.BeginScrollView(scrollRect, scroll, new Rect(0f, 0f, contentWidth, contentHeight));
 
         bool closeAfterGrid = HandleGridKeyboard(columns, rowCount, cellH, scrollRect);
 
         // 可见行范围（基于真实视口高度，与 Unity 原生 Select 一致只绘制可见项）
-        int firstRow = Mathf.Max(0, Mathf.FloorToInt(scroll.y / cellH) - 1);
-        int lastRow = Mathf.Min(rowCount - 1, Mathf.CeilToInt((scroll.y + scrollRect.height) / cellH) + 1);
-
-        // 预取可见区域上下各 3 行的异步预览（材质、网格都需要）：
-        // 快速滚动时新行的预览已在后台开始生成，接近原生 Select 的顺滑体验。
-        const int PrefetchRowPadding = 3;
-        int prefetchFirstRow = Mathf.Max(0, firstRow - PrefetchRowPadding);
-        int prefetchLastRow = Mathf.Min(rowCount - 1, lastRow + PrefetchRowPadding);
-        for (int r = prefetchFirstRow; r <= prefetchLastRow; r++)
-        {
-            for (int c = 0; c < columns; c++)
-            {
-                int idx = r * columns + c;
-                if (idx >= itemCount)
-                {
-                    break;
-                }
-                if (idx > 0 && filteredItems[idx - 1].typeKey != "Texture")
-                {
-                    EnsurePreviewRequested(filteredItems[idx - 1]);
-                }
-            }
-        }
-
-        // 本帧绘制前先清零；DrawThumbnail 发现仍有预览在后台渲染时会置 true，
-        // 帧末据此只请求一次 Repaint（出图后自动停止，不会空转闪烁）。
-        previewLoadingThisFrame = false;
+        int firstRow = Mathf.Max(0, Mathf.FloorToInt(scroll.y / cellH));
+        int lastRow = Mathf.Min(rowCount - 1, Mathf.FloorToInt((scroll.y + scrollRect.height) / cellH));
 
         // 标签样式：居中、超出截断（像原生 Select）；只创建一次并缓存
         if (gridLabelStyle == null)
@@ -1215,6 +1528,8 @@ public class VFXResourceSelectorWindow : EditorWindow
             }
         }
 
+        ReleaseOffscreenItemCaches();
+
         GUI.EndScrollView();
 
         if (closeAfterGrid)
@@ -1223,11 +1538,87 @@ public class VFXResourceSelectorWindow : EditorWindow
             return;
         }
 
-        // 仍有可见预览在后台渲染时，请求下一帧继续重绘（原生 ObjectSelector 的标准做法）；
-        // 全部出图后 IsLoadingAssetPreview 变为 false，重绘自动停止，不会持续闪烁/空转。
-        if (previewLoadingThisFrame)
+        // 仅在可见预览加载期间低频轮询；不在 OnGUI 中连续 Repaint，避免空转占用主线程。
+        if (activePreviewRequests.Count > 0 && !previewUpdateSubscribed)
+        {
+            EditorApplication.update += PollPreviewLoading;
+            previewUpdateSubscribed = true;
+        }
+
+        // 本帧缩略图预算耗尽、同屏还有可见项没加载完：请求下一帧继续，直到整屏加载完成（加载完自动停止，不空转）。
+        if (thumbLoadPending)
         {
             Repaint();
+        }
+    }
+
+    private void PollPreviewLoading()
+    {
+        if (this == null || activePreviewRequests.Count == 0)
+        {
+            EditorApplication.update -= PollPreviewLoading;
+            previewUpdateSubscribed = false;
+            return;
+        }
+
+        if (EditorApplication.timeSinceStartup >= nextPreviewRepaintTime)
+        {
+            nextPreviewRepaintTime = EditorApplication.timeSinceStartup + 0.1;
+            bool completedAny = false;
+            for (int i = activePreviewRequests.Count - 1; i >= 0; i--)
+            {
+                ResourceItem item = activePreviewRequests[i];
+                Object asset = item != null ? item.asset : null;
+                if (asset == null)
+                {
+                    CompletePreviewRequest(item, null);
+                    completedAny = true;
+                    continue;
+                }
+                if (IsPreviewLoading(item, asset))
+                {
+                    if (EditorApplication.timeSinceStartup - item.previewRequestStartedAt < MaxPreviewWaitSeconds)
+                    {
+                        continue;
+                    }
+                    CompletePreviewRequest(item, null);
+                    completedAny = true;
+                    continue;
+                }
+
+                Texture2D preview = GetAssetPreviewSafe(item, asset);
+                if (preview != null)
+                {
+                    CompletePreviewRequest(item, preview);
+                    completedAny = true;
+                }
+                else if (item.previewRequestAttempts < 2)
+                {
+                    // 个别 Unity 版本首次返回 null 且未报告 loading；只允许一次重试。
+                    item.previewRequestAttempts++;
+                    Texture2D retryPreview = GetAssetPreviewSafe(item, asset);
+                    if (retryPreview != null)
+                    {
+                        CompletePreviewRequest(item, retryPreview);
+                        completedAny = true;
+                    }
+                }
+                else
+                {
+                    CompletePreviewRequest(item, null);
+                    completedAny = true;
+                }
+            }
+
+            if (completedAny)
+            {
+                Repaint();
+            }
+            if (activePreviewRequests.Count == 0)
+            {
+                EditorApplication.update -= PollPreviewLoading;
+                previewUpdateSubscribed = false;
+            }
         }
     }
 
@@ -1348,52 +1739,314 @@ public class VFXResourceSelectorWindow : EditorWindow
         {
             return false;
         }
+        if (a.assetLoaded && b.assetLoaded && a.asset != null && a.asset == b.asset)
+        {
+            return true; // 内置资源没有 AssetDatabase 路径，用对象实例匹配
+        }
         return a.path == b.path && a.subAssetName == b.subAssetName;
     }
 
     private void DrawThumbnail(ResourceItem item, Rect rect)
     {
-        Object asset = item.GetAsset();
+        item.lastVisibleTime = EditorApplication.timeSinceStartup;
+
+        // 内置模板：资源已加载，直接绘制（内置贴图直接画，内置网格走预览）。
+        if (item.isBuiltin)
+        {
+            Object builtin = item.GetAsset();
+            Texture builtinTex = builtin as Texture;
+            if (builtinTex != null)
+            {
+                GUI.DrawTexture(rect, builtinTex, ScaleMode.ScaleToFit);
+                return;
+            }
+            DrawPreview(item, builtin, rect);
+            return;
+        }
+
+        if (item.preview != null)
+        {
+            GUI.DrawTexture(rect, item.preview, ScaleMode.ScaleToFit);
+            return;
+        }
+        if (item.previewRequestStarted && !item.previewRequestInFlight)
+        {
+            DrawPreviewFallback(item, rect);
+            return;
+        }
+        if (activePreviewRequests.Count >= MaxConcurrentPreviewRequests && !item.previewRequestInFlight)
+        {
+            DrawPreviewFallback(item, rect);
+            return;
+        }
+
+        // 贴图 / 材质 / 网格：按帧预算加载，超预算先占位、下一帧继续。
+        Object asset = GetAssetBudgeted(item);
         if (asset == null)
         {
             GUI.Label(rect, item.typeKey, EditorStyles.centeredGreyMiniLabel);
             return;
         }
+        DrawPreview(item, asset, rect);
+    }
 
-        // 贴图（含 Cubemap/Texture3D 等）：直接绘制资源本身。
-        Texture tex = asset as Texture;
-        if (tex != null)
+    /// <summary>贴图 / 材质 / 网格预览：限制并发预览数，并为结果保留稳定的小尺寸副本。</summary>
+    private void DrawPreview(ResourceItem item, Object asset, Rect rect)
+    {
+        // 优先用当前资源项持有的副本，避免 Unity 回收全局预览纹理后退回图标。
+        if (item.preview != null)
         {
-            GUI.DrawTexture(rect, tex, ScaleMode.ScaleToFit);
+            GUI.DrawTexture(rect, item.preview, ScaleMode.ScaleToFit);
             return;
         }
 
-        // 材质 / 网格（含 FBX 模型主资产）：与原生 ObjectSelector 相同的 AssetPreview 异步流程。
-        EnsurePreviewRequested(item);
-        Texture2D preview = AssetPreview.GetAssetPreview(asset);
-        if (preview != null)
+        // 贴图直接生成 128px 以内的独立缩略图，显示真实贴图内容，同时避免长时间持有原始大图。
+        Texture2D sourceTexture = asset as Texture2D;
+        if (sourceTexture != null && !item.textureCopyFailed)
         {
-            // 预览已生成：一次性绘制最终大图
-            GUI.DrawTexture(rect, preview, ScaleMode.ScaleToFit);
+            item.preview = CopyPreviewTexture(sourceTexture);
+            if (item.preview != null)
+            {
+                ReleaseItemAsset(item);
+                GUI.DrawTexture(rect, item.preview, ScaleMode.ScaleToFit);
+                return;
+            }
+            item.textureCopyFailed = true;
+        }
+
+        if (item.fallbackThumbnail == null)
+        {
+            item.fallbackThumbnail = GetMiniThumbnailSafe(item, asset);
+        }
+
+        if (!item.previewRequestStarted && activePreviewRequests.Count < MaxConcurrentPreviewRequests)
+        {
+            item.previewRequestStarted = true;
+            item.previewRequestInFlight = true;
+            item.previewRequestAttempts = 1;
+            item.previewRequestStartedAt = EditorApplication.timeSinceStartup;
+            activePreviewRequests.Add(item);
+            Texture2D preview = GetAssetPreviewSafe(item, asset);
+            if (preview != null)
+            {
+                CompletePreviewRequest(item, preview);
+                if (item.preview != null)
+                {
+                    GUI.DrawTexture(rect, item.preview, ScaleMode.ScaleToFit);
+                    return;
+                }
+            }
+        }
+
+        if (activePreviewRequests.Count > 0 && !previewUpdateSubscribed)
+        {
+            EditorApplication.update += PollPreviewLoading;
+            previewUpdateSubscribed = true;
+        }
+
+        DrawPreviewFallback(item, rect);
+    }
+
+    private void CompletePreviewRequest(ResourceItem item, Texture2D sourcePreview)
+    {
+        if (item == null)
+        {
             return;
         }
-
-        // 还在后台渲染：标记本帧需要继续重绘，直到出图（出图后自动停止，不会无限刷新）
-        if (AssetPreview.IsLoadingAssetPreview(asset.GetInstanceID()))
+        if (item.previewRequestInFlight)
         {
-            previewLoadingThisFrame = true;
+            item.previewRequestInFlight = false;
+            activePreviewRequests.Remove(item);
         }
-
-        // 加载期间用迷你缩略图做稳定占位（而不是文字），出图时不会出现“文字→图片”的跳变闪烁；
-        // 网格同样由此路径显示：预览未就绪时先显示小图标，就绪后显示渲染好的 3D 网格预览。
-        Texture2D mini = AssetPreview.GetMiniThumbnail(asset);
-        if (mini != null)
+        if (sourcePreview != null)
         {
-            GUI.DrawTexture(rect, mini, ScaleMode.ScaleToFit);
+            Texture2D stablePreview = CopyPreviewTexture(sourcePreview);
+            if (item.scanGeneration == scanGeneration)
+            {
+                item.preview = stablePreview;
+            }
+            else if (stablePreview != null)
+            {
+                DestroyImmediate(stablePreview);
+            }
+        }
+        ReleaseItemAsset(item);
+    }
+
+    private Texture2D GetAssetPreviewSafe(ResourceItem item, Object asset)
+    {
+        try
+        {
+            return asset != null ? AssetPreview.GetAssetPreview(asset) : null;
+        }
+        catch (Exception e)
+        {
+            LogPreviewErrorOnce(item, e);
+            return null;
+        }
+    }
+
+    private Texture2D GetMiniThumbnailSafe(ResourceItem item, Object asset)
+    {
+        try
+        {
+            return asset != null ? AssetPreview.GetMiniThumbnail(asset) : null;
+        }
+        catch (Exception e)
+        {
+            LogPreviewErrorOnce(item, e);
+            return null;
+        }
+    }
+
+    private bool IsPreviewLoading(ResourceItem item, Object asset)
+    {
+        try
+        {
+            return asset != null && AssetPreview.IsLoadingAssetPreview(asset.GetInstanceID());
+        }
+        catch (Exception e)
+        {
+            LogPreviewErrorOnce(item, e);
+            return false;
+        }
+    }
+
+    private void LogPreviewErrorOnce(ResourceItem item, Exception exception)
+    {
+        string path = item != null ? item.path : "未知资源";
+        if (failedAssetLoadWarnings.Add("preview:" + path))
+        {
+            Debug.LogWarning("[VFX Resource Selector] 生成预览失败：" + path + "\n" + exception.Message);
+        }
+    }
+
+    private static void ReleaseItemAsset(ResourceItem item)
+    {
+        if (item == null || item.isBuiltin)
+        {
+            return;
+        }
+        item.asset = null;
+        item.assetLoaded = false;
+    }
+
+    private static void DrawPreviewFallback(ResourceItem item, Rect rect)
+    {
+        if (item.fallbackThumbnail != null)
+        {
+            GUI.DrawTexture(rect, item.fallbackThumbnail, ScaleMode.ScaleToFit);
         }
         else
         {
             GUI.Label(rect, item.typeKey, EditorStyles.centeredGreyMiniLabel);
+        }
+    }
+
+    /// <summary>定期释放离开视口的资源和预览引用；当前可见项不受共享 LRU 容量影响。</summary>
+    private void ReleaseOffscreenItemCaches()
+    {
+        double now = EditorApplication.timeSinceStartup;
+        if (!cachePrunePending)
+        {
+            if (now < nextCachePruneTime)
+            {
+                return;
+            }
+            cachePrunePending = true;
+            cachePruneCursor = 0;
+        }
+
+        int released = 0;
+        while (cachePruneCursor < allItems.Count && released < 8)
+        {
+            ResourceItem item = allItems[cachePruneCursor++];
+            if (!item.isBuiltin && !item.previewRequestInFlight && now - item.lastVisibleTime > 1.0)
+            {
+                item.asset = null;
+                item.assetLoaded = false;
+                if (item.preview != null)
+                {
+                    DestroyImmediate(item.preview);
+                }
+                item.preview = null;
+                item.textureCopyFailed = false;
+                item.previewRequestStarted = false;
+                item.previewRequestAttempts = 0;
+                item.previewRequestStartedAt = 0.0;
+                item.fallbackThumbnail = null;
+                released++;
+            }
+        }
+
+        if (cachePruneCursor >= allItems.Count)
+        {
+            cachePrunePending = false;
+            cachePruneCursor = 0;
+            nextCachePruneTime = now + 1.0;
+        }
+        else
+        {
+            // 每帧最多销毁 8 张自有缩略图，避免滚动离屏时一次性释放大量原生纹理。
+            Repaint();
+        }
+    }
+
+    private static Texture2D CopyPreviewTexture(Texture2D source)
+    {
+        if (source == null)
+        {
+            return null;
+        }
+
+        const int maxThumbnailSize = 128;
+        float scale = Mathf.Min(1f, maxThumbnailSize / (float)Mathf.Max(source.width, source.height));
+        int width = Mathf.Max(1, Mathf.RoundToInt(source.width * scale));
+        int height = Mathf.Max(1, Mathf.RoundToInt(source.height * scale));
+        RenderTexture temporary = null;
+        RenderTexture previous = RenderTexture.active;
+        Texture2D copy = null;
+        try
+        {
+            temporary = RenderTexture.GetTemporary(width, height, 0,
+                RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+            Graphics.Blit(source, temporary);
+            RenderTexture.active = temporary;
+            copy = new Texture2D(width, height, TextureFormat.RGBA32, false, true)
+            {
+                hideFlags = HideFlags.HideAndDontSave
+            };
+            copy.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+            copy.Apply(false, true);
+            return copy;
+        }
+        catch
+        {
+            if (copy != null)
+            {
+                DestroyImmediate(copy);
+            }
+            return null;
+        }
+        finally
+        {
+            RenderTexture.active = previous;
+            if (temporary != null)
+            {
+                RenderTexture.ReleaseTemporary(temporary);
+            }
+        }
+    }
+
+    private void DestroyOwnedPreviews()
+    {
+        foreach (ResourceItem item in allItems)
+        {
+            if (item.preview != null)
+            {
+                DestroyImmediate(item.preview);
+                item.preview = null;
+            }
         }
     }
 
@@ -1415,12 +2068,31 @@ public class VFXResourceSelectorWindow : EditorWindow
             GUILayout.Label("未选中资源", EditorStyles.miniLabel);
         }
         GUILayout.FlexibleSpace();
-        if (GUILayout.Button("取消", GUILayout.Width(70)))
+        using (new EditorGUI.DisabledScope(selectedItem == null || selectedNone || selectedItem.isBuiltin))
         {
-            confirmed = false;
-            Close();
+            if (GUILayout.Button(new GUIContent("定位", "在 Project 窗口中选中并高亮此资源"), GUILayout.Width(70)))
+            {
+                LocateSelectedAsset();
+            }
         }
         EditorGUILayout.EndHorizontal();
+    }
+
+    private void LocateSelectedAsset()
+    {
+        if (selectedItem == null || selectedItem.isBuiltin)
+        {
+            return;
+        }
+
+        Object asset = selectedItem.GetAsset();
+        if (asset == null || string.IsNullOrEmpty(AssetDatabase.GetAssetPath(asset)))
+        {
+            return;
+        }
+
+        Selection.activeObject = asset;
+        EditorGUIUtility.PingObject(asset);
     }
 
     // ================= 设置与分类规则 =================
@@ -1655,6 +2327,17 @@ public class VFXResourceSelectorWindow : EditorWindow
 
     private void OnDisable()
     {
+        if (previewUpdateSubscribed)
+        {
+            EditorApplication.update -= PollPreviewLoading;
+            previewUpdateSubscribed = false;
+        }
+        if (meshScanUpdateSubscribed)
+        {
+            EditorApplication.update -= ProcessMeshScan;
+            meshScanUpdateSubscribed = false;
+        }
+        DestroyOwnedPreviews();
         if (onClosed != null)
         {
             Object result = null;
@@ -1684,6 +2367,14 @@ public class VFXResourceSelectorWindow : EditorWindow
         {
             s_Instance = null;
         }
+        loadedAssetCache.Clear();
+        loadedAssetCacheOrder.Clear();
+        meshRepresentationsCache.Clear();
+        meshRepresentationsCacheOrder.Clear();
+        pendingMeshPaths.Clear();
+        activePreviewRequests.Clear();
+        failedAssetLoadWarnings.Clear();
+        attemptedLoadKeys.Clear();
     }
 
     private bool TypeMatches(Object obj)

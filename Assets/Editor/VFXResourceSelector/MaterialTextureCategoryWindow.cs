@@ -20,6 +20,7 @@ public class MaterialTextureCategoryWindow : EditorWindow
 
     private List<TexturePropertyInfo> textureProperties = new List<TexturePropertyInfo>();
     private Vector2 scroll;
+    private Shader cachedShader;
 
     [MenuItem("Tools/Material Texture Category Selector")]
     public static void OpenFromMenu()
@@ -55,12 +56,19 @@ public class MaterialTextureCategoryWindow : EditorWindow
 
     private void RefreshProperties()
     {
-        textureProperties.Clear();
         if (targetMaterial == null)
         {
+            cachedShader = null;
+            textureProperties.Clear();
             return;
         }
         Shader shader = targetMaterial.shader;
+        if (shader == cachedShader)
+        {
+            return;
+        }
+        cachedShader = shader;
+        textureProperties.Clear();
         if (shader == null)
         {
             return;

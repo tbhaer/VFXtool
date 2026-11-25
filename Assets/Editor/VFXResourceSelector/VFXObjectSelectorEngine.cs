@@ -27,16 +27,26 @@ public class VFXObjectSelectorEngine : IObjectSelectorEngine
 
     public bool SelectObject(ISearchContext context, Action<Object, bool> onObjectSelectorClosed, Action<Object> onObjectSelectedUpdated)
     {
-        VFXSelectorSettings settings = VFXSelectorSettings.Instance;
-        if (!settings.interceptEnabled)
+        VFXSelectorSettings settings;
+        bool shouldIntercept;
+        try
         {
-            return false; // 未开启拦截：交给 Unity 默认选择器
+            settings = VFXSelectorSettings.Instance;
+            if (!settings.interceptEnabled)
+            {
+                return false; // 未开启拦截：交给 Unity 默认选择器
+            }
+            shouldIntercept = IsInterceptType(GetRequiredTypeNames(context), settings);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[VFX Resource Selector] 无法判断选择器字段类型，改用 Unity 原生选择器：" + e.Message);
+            return false;
         }
 
-        // 反射读取 requiredTypeNames，避免直接依赖 ObjectSelectorSearchContext 类型（兼容不同 Unity 版本）
-        if (!IsInterceptType(GetRequiredTypeNames(context), settings))
+        if (!shouldIntercept)
         {
-            return false; // 不是贴图/材质/网格类字段：交给 Unity 默认选择器
+            return false; // 未知或不支持的类型一律交给 Unity 原生选择器
         }
 
         // 打开自定义选择器（引擎接管）
@@ -60,8 +70,17 @@ public class VFXObjectSelectorEngine : IObjectSelectorEngine
         {
             return null;
         }
-        PropertyInfo prop = ctx.GetType().GetProperty("requiredTypeNames", BindingFlags.Public | BindingFlags.Instance);
-        return prop != null ? prop.GetValue(ctx, null) as IEnumerable<string> : null;
+        try
+        {
+            PropertyInfo prop = ctx.GetType().GetProperty("requiredTypeNames", BindingFlags.Public | BindingFlags.Instance);
+            return prop != null ? prop.GetValue(ctx, null) as IEnumerable<string> : null;
+        }
+        catch
+        {
+            // Unity 不同版本的 SearchContext 实现可能不存在该属性或 getter 不可用；
+            // 未能确认字段类型时让原生选择器接管，避免把未知类型错误送入自定义窗口。
+            return null;
+        }
     }
 
     /// <summary>根据字段要求的类型判断是否属于本工具接管范围。</summary>
@@ -69,12 +88,16 @@ public class VFXObjectSelectorEngine : IObjectSelectorEngine
     {
         if (typeNames == null)
         {
-            return true;
+            return false;
         }
 
         bool intercepted = false;
         foreach (string typeName in typeNames)
         {
+            if (string.IsNullOrEmpty(typeName))
+            {
+                return false;
+            }
             if (typeName.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 if (settings.interceptTextures) intercepted = true;
